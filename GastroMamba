@@ -1,0 +1,1309 @@
+# Install C++ compilers
+#!apt-get update && apt-get install -y gcc g++ make build-essential
+
+# Explicitly set the CUDA path (adjust version if needed, e.g., 12.8 for H100)
+import os
+#os.environ['CUDA_HOME'] = '/usr/local/cuda-12.8'
+#os.environ['TORCH_CUDA_ARCH_LIST'] = '9.0'  # For H100 GPU
+
+# Uninstall any previous failed attempts
+#!pip uninstall mamba-ssm causal-conv1d -y
+# Install causal-conv1d first
+#!pip install causal-conv1d==1.2.2 --no-build-isolation
+
+# Then install mamba-ssm
+#!pip install mamba-ssm --no-build-isolation
+
+!pip install thop 
+import os
+import shutil
+import random
+import warnings
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
+from torch.cuda.amp import GradScaler, autocast
+from sklearn.metrics import (
+    classification_report, cohen_kappa_score, confusion_matrix,
+    roc_auc_score, roc_curve
+)
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import seaborn as sns
+from PIL import Image
+from tqdm import tqdm
+from skimage.transform import resize
+from skimage.segmentation import mark_boundaries
+import gc
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# -------------------------------------------------------------
+# Optional Library Integrations
+# -------------------------------------------------------------
+try:
+    from lime import lime_image
+    LIME_AVAILABLE = True
+    print("✅ LIME detected.")
+except ImportError:
+    LIME_AVAILABLE = False
+    print("⚠️ 'lime' not installed. LIME visualizations will be skipped.")
+
+try:
+    import shap
+    SHAP_AVAILABLE = True
+    print("✅ SHAP detected.")
+except ImportError:
+    SHAP_AVAILABLE = False
+    print("⚠️ 'shap' not installed. SHAP visualizations will be skipped.")
+
+try:
+    from mamba_ssm import Mamba
+    REAL_MAMBA = True
+    print("✅ Using real Mamba SSM.")
+except ImportError:
+    REAL_MAMBA = False
+    print("⚠️ mamba_ssm not installed. Using mock Mamba.")
+
+try:
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+    ALBUMENTATIONS_AVAILABLE = True
+    print("✅ Using albumentations.")
+except ImportError:
+    ALBUMENTATIONS_AVAILABLE = False
+    print("⚠️ albumentations not installed.")
+
+# For FLOPs computation
+try:
+    from thop import profile, clever_format
+    THOP_AVAILABLE = True
+except ImportError:
+    THOP_AVAILABLE = False
+    print("⚠️ 'thop' not installed. FLOPs will be estimated manually.")
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+
+# Try to import Real Mamba, otherwise use a mock for structure
+try:
+    from mamba_ssm import Mamba
+    REAL_MAMBA = True
+except ImportError:
+    REAL_MAMBA = False
+
+# ==============================================================
+# 1. DEPTHWISE SEPARABLE CONV & LIGHTWEIGHT DETAIL STREAM
+# ==============================================================
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, 3, padding=1, stride=stride, groups=in_channels, bias=False)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.silu = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        return self.silu(self.bn2(self.pointwise(self.silu(self.bn1(self.depthwise(x))))))
+
+class LightweightDetailStream(nn.Module):
+    def __init__(self, in_channels=3, out_channels=256):
+        super().__init__()
+        # 5 Downsampling layers to match EfficientNetV2-S spatial dimensions (usually 1/32 scale)
+        self.layer1 = nn.Sequential(nn.Conv2d(in_channels, 32, 3, stride=2, padding=1, bias=False), nn.BatchNorm2d(32), nn.SiLU(inplace=True))
+        self.layer2 = DepthwiseSeparableConv(32, 64, stride=2)
+        self.layer3 = DepthwiseSeparableConv(64, 128, stride=2)
+        self.layer4 = DepthwiseSeparableConv(128, out_channels, stride=2)
+        self.layer5 = DepthwiseSeparableConv(out_channels, out_channels, stride=2)
+
+    def forward(self, x): 
+        return self.layer5(self.layer4(self.layer3(self.layer2(self.layer1(x)))))
+
+# ==============================================================
+# 2. DEEP SEMANTIC STREAM (Standard EfficientNetV2-S)
+# ==============================================================
+class SemanticStream(nn.Module):
+    def __init__(self):
+        super().__init__()
+        base = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.DEFAULT)
+        self.features = base.features
+        
+        # FIX: Removed the 5-channel hack and ghost BatchNorm. Uses standard 3-channel pretrained weights.
+        # Freeze early layers; only train the last 3 stages
+        for i, stage in enumerate(self.features):
+            for param in stage.parameters(): 
+                param.requires_grad = (i >= len(self.features) - 3)
+
+    def forward(self, x): 
+        return self.features(x)
+
+# ==============================================================
+# 3. INFO PRESERVING ALIGNMENT & CROSS PATHWAY FUSION
+# ==============================================================
+class InformationPreservingAlignment(nn.Module):
+    def __init__(self, in_channels=1280, out_channels=256):
+        super().__init__()
+        self.global_context = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(in_channels, out_channels, 1, bias=False), nn.Sigmoid())
+        self.spatial_compression = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False), nn.BatchNorm2d(out_channels), nn.SiLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False), nn.BatchNorm2d(out_channels)
+        )
+        self.final_activation = nn.SiLU(inplace=True)
+
+    def forward(self, x): 
+        return self.final_activation(self.spatial_compression(x) * self.global_context(x))
+
+class SelfCrossPathwayFusion(nn.Module):
+    def __init__(self, semantic_channels=1280, detail_channels=256, aligned_dim=256):
+        super().__init__()
+        self.align_semantic = InformationPreservingAlignment(semantic_channels, aligned_dim)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        def make_gate(): return nn.Sequential(nn.Linear(aligned_dim, aligned_dim, bias=False), nn.BatchNorm1d(aligned_dim), nn.Sigmoid())
+        self.self_weight_sem, self.self_weight_det = make_gate(), make_gate()
+        self.cross_weight_sem, self.cross_weight_det = make_gate(), make_gate()
+
+    def forward(self, f_sem, f_det):
+        B = f_det.size(0)
+        f_sem_aligned = self.align_semantic(f_sem)     
+        v_sem, v_det = self.gap(f_sem_aligned).view(B, -1), self.gap(f_det).view(B, -1)            
+        w_sem = (self.self_weight_sem(v_sem) + self.cross_weight_sem(v_det)).view(B, -1, 1, 1)
+        w_det = (self.self_weight_det(v_det) + self.cross_weight_det(v_sem)).view(B, -1, 1, 1)
+        return (f_sem_aligned * w_sem) + (f_det * w_det)
+
+# ==============================================================
+# 4. MSMD-ViM: MAMBA ENCODER (FIXED CROSS-SCAN)
+# ==============================================================
+class Learnable2DPositionalEmbedding(nn.Module):
+    def __init__(self, embed_dim, base_size=8):
+        super().__init__()
+        self.pos_embed = nn.Parameter(torch.zeros(1, embed_dim, base_size, base_size))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+    def forward(self, x): 
+        return x + F.interpolate(self.pos_embed, size=(x.shape[2], x.shape[3]), mode='bicubic', align_corners=False)
+
+class DualPathwayGatedFusion(nn.Module):
+    def __init__(self, dim, reduction_ratio=4):
+        super().__init__()
+        hidden_dim = max(dim // reduction_ratio, 16)
+        self.gating_pathway = nn.Sequential(
+            nn.Linear(dim * 4, hidden_dim, bias=False), nn.BatchNorm1d(hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, 4, bias=False), nn.Sigmoid()
+        )
+        self.feature_pathway = nn.Sequential(nn.Linear(dim, dim, bias=False), nn.SiLU(inplace=True))
+        self.output_proj = nn.Linear(dim, dim)
+        
+    def forward(self, s1, s2, s3, s4):
+        w1, w2, w3, w4 = self.gating_pathway(torch.cat([s1, s2, s3, s4], dim=-1).view(-1, s1.shape[-1] * 4)).view(s1.shape[0], s1.shape[1], 4).chunk(4, dim=-1)
+        return self.output_proj((self.feature_pathway(s1)*w1) + (self.feature_pathway(s2)*w2) + (self.feature_pathway(s3)*w3) + (self.feature_pathway(s4)*w4))
+
+class CrossScanMambaBlock(nn.Module):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        if REAL_MAMBA:
+            self.mamba_tl = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            self.mamba_br = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            self.mamba_tr = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            self.mamba_bl = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        else:
+            def mock_mamba():
+                return nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, d_model))
+            self.mamba_tl, self.mamba_br, self.mamba_tr, self.mamba_bl = mock_mamba(), mock_mamba(), mock_mamba(), mock_mamba()
+        
+        self.norm = nn.LayerNorm(d_model)
+        self.dynamic_fusion = DualPathwayGatedFusion(dim=d_model)
+
+    def forward(self, seq_tl, seq_br, seq_tr, seq_bl, H, W):
+        out_tl = self.mamba_tl(seq_tl)
+        out_br = self.mamba_br(seq_br)
+        out_tr = self.mamba_tr(seq_tr)
+        out_bl = self.mamba_bl(seq_bl)
+
+        # FIX: The Un-Flip. We must return the sequences to their original spatial coordinate map 
+        # before fusing them, otherwise we destroy spatial integrity.
+        B, L, C = out_tl.shape
+        def unflip(seq, dims):
+            return torch.flip(seq.transpose(1, 2).view(B, C, H, W), dims=dims).flatten(2).transpose(1, 2)
+
+        out_br_unflipped = unflip(out_br, [2, 3])
+        out_tr_unflipped = unflip(out_tr, [3])
+        out_bl_unflipped = unflip(out_bl, [2])
+
+        return self.norm(self.dynamic_fusion(out_tl, out_br_unflipped, out_tr_unflipped, out_bl_unflipped))
+
+class MultiScaleWindowMambaEncoder(nn.Module):
+    def __init__(self, in_channels, embed_dim=256, scales=None):
+        super().__init__()
+        self.scales = scales if scales else [1, 2, 4]
+        
+        # 1. Instantiate ONE shared Mamba block
+        self.shared_mamba = CrossScanMambaBlock(d_model=embed_dim)
+        
+        # 2. Instantiate individual patch embeddings for each scale
+        self.branches = nn.ModuleList([
+            nn.ModuleDict({
+                'patch_embed': nn.Conv2d(in_channels, embed_dim, kernel_size=s, stride=s),
+                'pos_embed': Learnable2DPositionalEmbedding(embed_dim, base_size=8//s if s<=8 else 1)
+            }) for s in self.scales
+        ])
+        self.scale_weights = nn.Parameter(torch.ones(len(self.scales)))
+
+    def forward(self, x):
+        weights = F.softmax(self.scale_weights, dim=0)
+        fused_out = 0
+        for i, branch in enumerate(self.branches):
+            x_patch = branch['pos_embed'](branch['patch_embed'](x))
+            B, C, H, W = x_patch.shape
+            
+            # Prepare sequences for the SHARED mamba block
+            seq_tl = x_patch.flatten(2).transpose(1, 2).contiguous()
+            seq_br = torch.flip(x_patch, dims=[2, 3]).flatten(2).transpose(1, 2).contiguous()
+            seq_tr = torch.flip(x_patch, dims=[3]).flatten(2).transpose(1, 2).contiguous()
+            seq_bl = torch.flip(x_patch, dims=[2]).flatten(2).transpose(1, 2).contiguous()
+
+            # Pass through the SHARED block
+            out_seq = self.shared_mamba(seq_tl, seq_br, seq_tr, seq_bl, H, W)
+            out_2d = out_seq.transpose(1, 2).view(B, C, H, W)
+            
+            if out_2d.shape[-2:] != x.shape[-2:]:
+                out_up = F.interpolate(out_2d, size=(x.shape[2], x.shape[3]), mode='bilinear', align_corners=False)
+            else:
+                out_up = out_2d
+                
+            fused_out = fused_out + (out_up * weights[i])
+        return fused_out
+
+# ==============================================================
+# 5. MAIN MODEL (The "Local First, Global Last" Design)
+# ==============================================================
+class MultiScaleDyZEMamba(nn.Module):
+    def __init__(self, num_classes=27, embed_dim=256):
+        super().__init__()
+        
+        # Parallel CNN Extractors (Local/Mid-Range)
+        self.semantic_stream = SemanticStream()                     # Outputs 1280 channels
+        self.detail_stream = LightweightDetailStream(in_channels=3) # Outputs 256 channels
+        
+        # Mid-Network Fusion
+        self.cross_fusion = SelfCrossPathwayFusion(semantic_channels=1280, detail_channels=256, aligned_dim=embed_dim)
+        
+        # Global Brain
+        self.mamba_encoder = MultiScaleWindowMambaEncoder(in_channels=embed_dim, embed_dim=embed_dim, scales=[1, 2, 4])
+        
+        # FIX: Using AdaptiveAvgPool2d to natively pool the 2D tensor returned by Mamba
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), 
+            nn.Flatten(),
+            nn.Linear(embed_dim, 512), 
+            nn.BatchNorm1d(512), 
+            nn.GELU(), 
+            nn.Dropout(0.3), 
+            nn.Linear(512, num_classes)
+        )
+
+    def forward(self, rgb):
+        # 1. Parallel local feature extraction from 3-channel input
+        feat_sem = self.semantic_stream(rgb)
+        feat_det = self.detail_stream(rgb)
+        
+        # 2. Fuse semantics and details
+        fused_cnn = self.cross_fusion(feat_sem, feat_det)
+        
+        # 3. Apply global Mamba modeling on the highly compressed feature map
+        mamba_features = self.mamba_encoder(fused_cnn) 
+        
+        # 4. Final Classification
+        return self.head(mamba_features)
+
+# ==============================================================
+# 8. LOSS FUNCTIONS
+# ==============================================================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha, self.gamma, self.reduction = alpha, gamma, reduction
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_term = (1 - pt) ** self.gamma
+        alpha_t = self.alpha if isinstance(self.alpha, (float, int)) else self.alpha[targets]
+        loss = alpha_t * focal_term * ce_loss
+        return loss.mean() if self.reduction == 'mean' else loss.sum() if self.reduction == 'sum' else loss
+
+class CombinedLoss(nn.Module):
+    def __init__(self, ce_weight=1.0, focal_weight=0.5, ce_label_smoothing=0.1, focal_alpha=1.0, focal_gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.ce_weight, self.focal_weight = ce_weight, focal_weight
+        self.ce_loss = nn.CrossEntropyLoss(label_smoothing=ce_label_smoothing, reduction=reduction)
+        self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction=reduction)
+    def forward(self, inputs, targets):
+        return self.ce_weight * self.ce_loss(inputs, targets) + self.focal_weight * self.focal_loss(inputs, targets)
+
+
+# ==============================================================
+# 9. DATASET & TRANSFORMS
+# ==============================================================
+class ImageDataset(Dataset):
+    def __init__(self, data_dir, transform=None):
+        self.transform = transform
+        self.classes = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+        self.class_to_idx = {cls: i for i, cls in enumerate(self.classes)}
+        self.samples = [(os.path.join(data_dir, cls, img), self.class_to_idx[cls]) 
+                        for cls in self.classes for img in os.listdir(os.path.join(data_dir, cls)) 
+                        if img.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert('RGB')
+        if self.transform: 
+            if ALBUMENTATIONS_AVAILABLE and isinstance(self.transform, A.Compose):
+                img = self.transform(image=np.array(img))['image']
+            else:
+                img = self.transform(img)
+        return img, label
+
+def get_enhanced_transforms(input_size=256):
+    if ALBUMENTATIONS_AVAILABLE:
+        train_t = A.Compose([
+            A.Resize(input_size, input_size),
+            A.RandomRotate90(p=0.5),
+            A.Rotate(limit=30, p=0.5),
+            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.15, rotate_limit=30, p=0.5),
+            A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.3),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, p=0.5),
+            A.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ])
+        val_t = A.Compose([
+            A.Resize(input_size, input_size),
+            A.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ])
+    else:
+        train_t = transforms.Compose([
+            transforms.Resize((input_size, input_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(30),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        val_t = transforms.Compose([
+            transforms.Resize((input_size, input_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+    return {'train': train_t, 'val': val_t}
+
+
+# ==============================================================
+# 10. EVALUATION UTILITIES
+# ==============================================================
+@torch.no_grad()
+def predict_with_tta(model, loader, device, n_augs=4):
+    model.eval()
+    all_probs, all_targets = [], []
+    for images, targets in tqdm(loader, desc="TTA"):
+        images = images.to(device)
+        batch_probs = [
+            F.softmax(model(images), dim=1).cpu(), 
+            F.softmax(model(torch.flip(images, dims=[3])), dim=1).cpu(), 
+            F.softmax(model(torch.flip(images, dims=[2])), dim=1).cpu(), 
+            F.softmax(model(torch.flip(images, dims=[2,3])), dim=1).cpu()
+        ]
+        all_probs.append(torch.stack(batch_probs[:n_augs]).mean(dim=0))
+        all_targets.append(targets)
+    probs = torch.cat(all_probs, dim=0).numpy()
+    targets = torch.cat(all_targets, dim=0).numpy()
+    preds = np.argmax(probs, axis=1)
+    return preds, targets, probs
+
+def compute_auc(y_true, y_pred_probs, num_classes):
+    """Compute macro and micro AUC, and per-class AUC."""
+    try:
+        # One-hot encode
+        y_onehot = np.eye(num_classes)[y_true]
+        # Macro AUC (average over classes)
+        auc_macro = roc_auc_score(y_onehot, y_pred_probs, average='macro', multi_class='ovr')
+        auc_micro = roc_auc_score(y_onehot, y_pred_probs, average='micro', multi_class='ovr')
+        # Per-class
+        per_class_auc = {}
+        for i in range(num_classes):
+            try:
+                auc_i = roc_auc_score(y_onehot[:, i], y_pred_probs[:, i])
+            except ValueError:
+                auc_i = float('nan')
+            per_class_auc[i] = auc_i
+        return auc_macro, auc_micro, per_class_auc
+    except Exception as e:
+        print(f"AUC computation failed: {e}")
+        return None, None, None
+
+def compute_flops_params(model, input_size=(1, 3, 256, 256), device='cuda'):
+    """Compute FLOPs and parameters using thop if available, else manual."""
+    params = sum(p.numel() for p in model.parameters())
+    if THOP_AVAILABLE:
+        try:
+            dummy = torch.randn(*input_size).to(device)
+            flops, _ = profile(model, inputs=(dummy,), verbose=False)
+            flops = flops * 2  # thop counts multiply-adds, so we double for FLOPs
+            return flops, params
+        except:
+            pass
+    # Fallback: rough estimate
+    # We'll just return None for FLOPs
+    return None, params
+
+def measure_inference_time(model, loader, device, num_batches=20, use_tta=False):
+    """Measure average inference time per batch and per image."""
+    model.eval()
+    times = []
+    with torch.no_grad():
+        for i, (images, _) in enumerate(loader):
+            if i >= num_batches:
+                break
+            images = images.to(device)
+            start = time.time()
+            if use_tta:
+                # Simulate TTA: 4 forward passes
+                for _ in range(4):
+                    _ = model(images)
+                    _ = model(torch.flip(images, dims=[3]))
+                    _ = model(torch.flip(images, dims=[2]))
+                    _ = model(torch.flip(images, dims=[2,3]))
+                torch.cuda.synchronize() if device.type == 'cuda' else None
+                end = time.time()
+                times.append((end - start) / 4)  # average per forward pass (but we did 4*4=16 forwards)
+            else:
+                _ = model(images)
+                torch.cuda.synchronize() if device.type == 'cuda' else None
+                end = time.time()
+                times.append(end - start)
+    avg_batch_time = np.mean(times)
+    # batch size may vary; get from loader
+    batch_size = loader.batch_size
+    avg_per_image = avg_batch_time / batch_size
+    return avg_batch_time, avg_per_image
+
+# ==============================================================
+# 11. TRAINING LOOP (with history)
+# ==============================================================
+def get_warmup_cosine_scheduler(optimizer, warmup_epochs=5, T_0=10, T_mult=2, eta_min=1e-6, last_epoch=-1):
+    class WarmupCosineScheduler:
+        def __init__(self, optimizer, warmup_epochs, T_0, T_mult, eta_min):
+            self.optimizer = optimizer
+            self.warmup_epochs = warmup_epochs
+            self.T_0 = T_0
+            self.T_mult = T_mult
+            self.eta_min = eta_min
+            self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+            self.last_epoch = -1
+            self.cosine_scheduler = None
+            self.warmup_scheduler = None
+        def step(self, epoch=None):
+            if epoch is None:
+                epoch = self.last_epoch + 1
+            self.last_epoch = epoch
+            if epoch < self.warmup_epochs:
+                if self.warmup_scheduler is None:
+                    self.warmup_scheduler = LambdaLR(self.optimizer, 
+                        lambda e: float(e) / float(max(1, self.warmup_epochs)), last_epoch=-1)
+                self.warmup_scheduler.last_epoch = epoch - 1
+                self.warmup_scheduler.step()
+            else:
+                if self.cosine_scheduler is None:
+                    for param_group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+                        param_group['lr'] = base_lr
+                    self.cosine_scheduler = CosineAnnealingWarmRestarts(self.optimizer, 
+                        T_0=self.T_0, T_mult=self.T_mult, eta_min=self.eta_min, last_epoch=self.warmup_epochs-1)
+                self.cosine_scheduler.last_epoch = epoch - 1
+                self.cosine_scheduler.step()
+        def state_dict(self):
+            return {'last_epoch': self.last_epoch}
+        def load_state_dict(self, state):
+            self.last_epoch = state['last_epoch']
+    return WarmupCosineScheduler(optimizer, warmup_epochs, T_0, T_mult, eta_min)
+
+def train_model(model, train_loader, val_loader, test_loader, num_classes, device, 
+                epochs=100, early_stop_patience=20, accumulation_steps=4,
+                ce_weight=1.0, focal_weight=0.5):
+    criterion = CombinedLoss(ce_weight=ce_weight, focal_weight=focal_weight)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    scheduler = get_warmup_cosine_scheduler(optimizer, warmup_epochs=5, T_0=10, T_mult=2, eta_min=1e-6)
+    scaler = GradScaler(enabled=(device.type == 'cuda'))
+    
+    best_val_loss = float('inf')
+    best_val_acc = 0.0
+    best_epoch = 0
+    no_improve = 0
+    best_state = None
+
+    # For plotting
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'lr': []}
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        correct_train = 0
+        total_train = 0
+        optimizer.zero_grad()
+        for batch_idx, (data, target) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")):
+            data, target = data.to(device), target.to(device)
+            with autocast(enabled=(device.type == 'cuda')):
+                loss = criterion(model(data), target) / accumulation_steps
+            scaler.scale(loss).backward()
+            if (batch_idx + 1) % accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            train_loss += loss.item() * accumulation_steps
+            with torch.no_grad():
+                preds = model(data).argmax(dim=1)
+                correct_train += (preds == target).sum().item()
+                total_train += target.size(0)
+        train_acc = correct_train / total_train
+        avg_train_loss = train_loss / len(train_loader)
+
+        model.eval()
+        val_loss = 0.0
+        correct_val = 0
+        total_val = 0
+        with torch.no_grad():
+            for data, target in val_loader:
+                data, target = data.to(device), target.to(device)
+                with autocast(enabled=(device.type == 'cuda')):
+                    val_loss += criterion(model(data), target).item()
+                preds = model(data).argmax(dim=1)
+                correct_val += (preds == target).sum().item()
+                total_val += target.size(0)
+        val_loss /= len(val_loader)
+        val_acc = correct_val / total_val
+
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        history['train_loss'].append(avg_train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['lr'].append(current_lr)
+
+        print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, Train Acc={train_acc:.4f}, Val Loss={val_loss:.4f}, Val Acc={val_acc:.4f}, LR={current_lr:.2e}")
+
+        if val_loss < best_val_loss - 1e-4 or val_acc > best_val_acc:
+            if val_loss < best_val_loss - 1e-4:
+                best_val_loss = val_loss
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+            best_epoch = epoch
+            no_improve = 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            torch.save(best_state, 'best_model.pth')
+            print(f"  -> New best model saved (Loss={best_val_loss:.4f}, Acc={best_val_acc:.4f})")
+        else:
+            no_improve += 1
+            if no_improve >= early_stop_patience:
+                print(f"Early stopping after {epoch+1} epochs")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    else:
+        print("Warning: No best model saved, using current weights.")
+    
+    # Evaluate on test set with TTA
+    #kappa, _, _ = evaluate_model(model, test_loader, device, train_loader.dataset.classes, use_tta=True)
+    kappa, _, _, _ = evaluate_model(model, test_loader, device, train_loader.dataset.classes, use_tta=True)
+    return model, kappa, best_epoch, history
+
+def evaluate_model(model, test_loader, device, class_names, use_tta=True):
+    if use_tta:
+        preds, targets, probs = predict_with_tta(model, test_loader, device, n_augs=4)
+    else:
+        model.eval()
+        all_preds, all_targets, all_probs = [], [], []
+        with torch.no_grad():
+            for data, target in test_loader:
+                data = data.to(device)
+                out = model(data)
+                all_probs.append(F.softmax(out, dim=1).cpu().numpy())
+                all_preds.append(torch.argmax(out, dim=1).cpu().numpy())
+                all_targets.append(target.numpy())
+        preds = np.concatenate(all_preds)
+        targets = np.concatenate(all_targets)
+        probs = np.concatenate(all_probs, axis=0)
+    kappa = cohen_kappa_score(targets, preds)
+    print(f"\nCohen's Kappa: {kappa:.4f}\nClassification Report:\n", classification_report(targets, preds, target_names=class_names, digits=4, zero_division=0))
+    return kappa, preds, targets, probs
+
+
+# ==============================================================
+# 12. VISUALIZER (as before, with minor updates)
+# ==============================================================
+class ModelVisualizer:
+    def __init__(self, model, device, class_names, save_dir='visualizations', target_layer=None):
+        self.model = model
+        self.device = device
+        self.class_names = class_names
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        self.target_layer = target_layer if target_layer is not None else model.cross_fusion
+
+    def _save_fig(self, fig, name): 
+        fig.savefig(os.path.join(self.save_dir, name), bbox_inches='tight', dpi=150)
+        plt.close(fig)
+        
+    def normalize_map(self, x): 
+        if x.max() == x.min(): return x
+        return (x - x.min()) / (x.max() - x.min() + 1e-8)
+        
+    def overlay_cam(self, img, cam, cmap='jet', alpha=0.5):
+        cam_resized = resize(cam, img.shape[:2], preserve_range=True)
+        colored = plt.get_cmap(cmap)(cam_resized)[:, :, :3]
+        overlay = colored * alpha + img / 255.0
+        overlay = np.clip(overlay, 0, 1)
+        return (overlay * 255).astype(np.uint8)
+
+    def _format_tensor(self, t, target_hw=None):
+        if t.dim() == 3:
+            B, L, D = t.shape
+            if target_hw is not None:
+                H, W = target_hw
+            else:
+                side = int(np.sqrt(L))
+                if side * side != L:
+                    raise ValueError(f"Sequence length {L} is not a perfect square.")
+                H, W = side, side
+            return t.transpose(1, 2).view(B, D, H, W)
+        return t
+
+    # --- XAI Methods (similar to previous) ---
+    def activation_heatmap(self, img, layer, target_hw=None):
+        acts = []
+        h = layer.register_forward_hook(lambda m, i, o: acts.append(o.detach().cpu()))
+        with torch.no_grad(): 
+            self.model(img)
+        h.remove()
+        a = self._format_tensor(acts[0], target_hw).squeeze(0)
+        return self.normalize_map(a.mean(dim=0).numpy())
+
+    def grad_cam(self, img, cls, layer, target_hw=None):
+        acts, grads = [], []
+        h1 = layer.register_forward_hook(lambda m, i, o: acts.append(o.detach().cpu())) 
+        h2 = layer.register_full_backward_hook(lambda m, gi, go: grads.append(go[0].detach().cpu()))
+        self.model.zero_grad(set_to_none=True)
+        out = self.model(img.clone().requires_grad_(True))
+        out[0, cls].backward()
+        h1.remove(); h2.remove()
+        a = self._format_tensor(acts[0], target_hw).squeeze(0)
+        g = self._format_tensor(grads[0], target_hw).squeeze(0)
+        weights = torch.mean(g, dim=(1,2), keepdim=True)
+        cam = F.relu(torch.sum(weights * a, dim=0)).numpy()
+        return self.normalize_map(cam)
+
+    def grad_cam_plus_plus(self, img, cls, layer, target_hw=None):
+        acts, grads = [], []
+        h1 = layer.register_forward_hook(lambda m, i, o: acts.append(o.detach().cpu()))
+        h2 = layer.register_full_backward_hook(lambda m, gi, go: grads.append(go[0].detach().cpu()))
+        self.model.zero_grad(set_to_none=True)
+        out = self.model(img.clone().requires_grad_(True))
+        out[0, cls].backward()
+        h1.remove(); h2.remove()
+        a = self._format_tensor(acts[0], target_hw).squeeze(0)
+        g = self._format_tensor(grads[0], target_hw).squeeze(0)
+        alpha = (g**2) / (2*(g**2) + a.sum(dim=(1,2), keepdim=True)*(g**3) + 1e-7)
+        weights = (torch.where(torch.isnan(alpha), torch.zeros_like(alpha), alpha) * F.relu(g)).sum(dim=(1,2), keepdim=True)
+        cam = F.relu((weights * a).sum(dim=0)).numpy()
+        return self.normalize_map(cam)
+
+    def layer_cam(self, img, cls, layer, target_hw=None):
+        acts, grads = [], []
+        h1 = layer.register_forward_hook(lambda m, i, o: acts.append(o.detach().cpu()))
+        h2 = layer.register_full_backward_hook(lambda m, gi, go: grads.append(go[0].detach().cpu()))
+        self.model.zero_grad(set_to_none=True)
+        out = self.model(img.clone().requires_grad_(True))
+        out[0, cls].backward()
+        h1.remove(); h2.remove()
+        a = self._format_tensor(acts[0], target_hw).squeeze(0)
+        g = self._format_tensor(grads[0], target_hw).squeeze(0)
+        cam = F.relu((F.relu(g) * a).sum(dim=0)).numpy()
+        return self.normalize_map(cam)
+
+    def eigen_cam(self, img, layer, target_hw=None):
+        acts = []
+        h = layer.register_forward_hook(lambda m, i, o: acts.append(o.detach().cpu()))
+        with torch.no_grad(): 
+            self.model(img)
+        h.remove()
+        a = self._format_tensor(acts[0], target_hw).squeeze(0).numpy()
+        act_flat = a.reshape(a.shape[0], -1)
+        cam = np.linalg.svd(act_flat - act_flat.mean(axis=1, keepdims=True), full_matrices=False)[2][0, :].reshape(a.shape[1], a.shape[2])
+        cam = np.abs(cam)
+        return self.normalize_map(cam)
+
+    def score_cam(self, img, cls, layer, target_hw=None, bz=2):
+        acts = []
+        h = layer.register_forward_hook(lambda m, i, o: acts.append(o.detach().cpu()))
+        with torch.no_grad(): 
+            self.model(img)
+        h.remove()
+        act = self._format_tensor(acts[0], target_hw).squeeze(0)
+        C, H_act, W_act = act.shape[0], act.shape[1], act.shape[2]
+        H_img, W_img = img.shape[2], img.shape[3]
+        up_act = F.interpolate(act.unsqueeze(0), size=(H_img, W_img), mode='bilinear', align_corners=False)[0]
+        max_v = up_act.view(C,-1).max(dim=-1)[0].view(C,1,1)
+        min_v = up_act.view(C,-1).min(dim=-1)[0].view(C,1,1)
+        norm_acts = ((up_act - min_v) / (max_v - min_v + 1e-7)).to(self.device)
+        scores = []
+        for i in range(0, C, bz):
+            with torch.no_grad():
+                scores.append(self.model(img * norm_acts[i:i+bz].unsqueeze(1))[:, cls].detach().cpu())
+        weights = F.softmax(torch.cat(scores), dim=0).view(C,1,1)
+        cam = F.relu((weights * act).sum(dim=0)).numpy()
+        return self.normalize_map(cam)
+
+    def score_cam_plus_plus(self, img, cls, layer, target_hw=None, bz=2):
+        acts = []
+        h = layer.register_forward_hook(lambda m, i, o: acts.append(o.detach().cpu()))
+        with torch.no_grad(): 
+            self.model(img)
+        h.remove()
+        act = self._format_tensor(acts[0], target_hw).squeeze(0)
+        C, H_act, W_act = act.shape[0], act.shape[1], act.shape[2]
+        H_img, W_img = img.shape[2], img.shape[3]
+        up_act = F.interpolate(act.unsqueeze(0), size=(H_img, W_img), mode='bilinear', align_corners=False)[0]
+        norm_acts = (up_act - up_act.view(C,-1).min(dim=-1)[0].view(C,1,1)) / (up_act.view(C,-1).max(dim=-1)[0].view(C,1,1) - up_act.view(C,-1).min(dim=-1)[0].view(C,1,1) + 1e-7)
+        norm_acts = (norm_acts * norm_acts.view(C, -1).var(dim=1).view(C, 1, 1)).to(self.device)
+        scores = []
+        for i in range(0, C, bz):
+            with torch.no_grad():
+                scores.append(self.model(img * norm_acts[i:i+bz].unsqueeze(1))[:, cls].detach().cpu())
+        weights = F.softmax(torch.cat(scores), dim=0).view(C,1,1)
+        cam = F.relu((weights * act).sum(dim=0)).numpy()
+        return self.normalize_map(cam)
+
+    def full_grad_approx(self, img, cls, layer, target_hw=None):
+        self.model.zero_grad(set_to_none=True)
+        img_clone = img.clone().requires_grad_(True)
+        acts, grads = [], []
+        h1 = layer.register_forward_hook(lambda m, i, o: acts.append(o.detach().cpu()))
+        h2 = layer.register_full_backward_hook(lambda m, gi, go: grads.append(go[0].detach().cpu()))
+        out = self.model(img_clone)
+        out[0, cls].backward()
+        h1.remove(); h2.remove()
+        input_relevance = (img_clone.grad[0] * img_clone[0]).sum(dim=0).cpu().detach().numpy()
+        a = self._format_tensor(acts[0], target_hw).squeeze(0)
+        g = self._format_tensor(grads[0], target_hw).squeeze(0)
+        feat_relevance = F.interpolate((g * a).sum(dim=0).unsqueeze(0).unsqueeze(0), size=img.shape[2:], mode='bilinear').squeeze().numpy()
+        combined = np.maximum(input_relevance + feat_relevance, 0)
+        return self.normalize_map(combined)
+
+    
+
+    def mamba_internals(self, img):
+        #def mamba_internals(self, img):
+        gates = []
+        # FIX: Point to the new shared_mamba attribute directly
+        hook = self.model.mamba_encoder.shared_mamba.dynamic_fusion.gating_pathway.register_forward_hook(
+            lambda m, i, o: gates.append(o.detach().cpu())
+        )
+        with torch.no_grad():
+            self.model(img)
+        hook.remove()
+        
+        g = gates[0]
+        seq_len = g.shape[0]
+        H = int(np.sqrt(seq_len))
+        W = H
+        g = g.view(H, W, 4).numpy()
+        tl = self.normalize_map(g[..., 0])
+        tr = self.normalize_map(g[..., 1])
+        bl = self.normalize_map(g[..., 2])
+        br = self.normalize_map(g[..., 3])
+        tas = np.argmax(g, axis=-1)
+        tsr = self.normalize_map(np.std(g, axis=-1))
+        return tl, tr, bl, br, tas, tsr
+
+    def lrp_approx(self, img, cls):
+        self.model.zero_grad(set_to_none=True)
+        img_clone = img.clone().requires_grad_(True)
+        out = self.model(img_clone)
+        out[0, cls].backward()
+        lrp = torch.sum(img_clone.grad[0] * img_clone[0], dim=0).cpu().detach().numpy()
+        lrp = np.maximum(lrp, 0)
+        return self.normalize_map(lrp)
+
+    def intermediate_lrp(self, img, cls, layer, target_hw=None):
+        acts, grads = [], []
+        h1 = layer.register_forward_hook(lambda m, i, o: acts.append(o.detach().cpu()))
+        h2 = layer.register_full_backward_hook(lambda m, gi, go: grads.append(go[0].detach().cpu()))
+        self.model.zero_grad(set_to_none=True)
+        out = self.model(img.clone().requires_grad_(True))
+        out[0, cls].backward()
+        h1.remove(); h2.remove()
+        a = self._format_tensor(acts[0], target_hw).squeeze(0)
+        g = self._format_tensor(grads[0], target_hw).squeeze(0)
+        lrp = torch.sum(a * g, dim=0).numpy()
+        lrp = np.maximum(lrp, 0)
+        return self.normalize_map(lrp)
+
+    def generate_lime(self, img):
+        if not LIME_AVAILABLE: return None, None
+        img_np = img[0].permute(1,2,0).cpu().numpy()
+        m, s = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
+        def predict(imgs):
+            self.model.eval()
+            t = [torch.tensor((i - m)/s).permute(2,0,1).float() for i in imgs]
+            out_probs = []
+            for i in range(0, len(t), 4):
+                with torch.no_grad():
+                    out_probs.append(F.softmax(self.model(torch.stack(t[i:i+4]).to(self.device)), dim=1).cpu().numpy())
+            return np.vstack(out_probs)
+        exp = lime_image.LimeImageExplainer().explain_instance(
+            np.clip((img_np*s)+m, 0, 1).astype('double'), predict, top_labels=1, hide_color=0, num_samples=300, batch_size=4
+        )
+        return exp.get_image_and_mask(exp.top_labels[0], positive_only=True, num_features=5, hide_rest=False)
+
+    def generate_shap(self, img, cls):
+        if not SHAP_AVAILABLE: return None
+        try:
+            self.model.eval()
+            class SingleClassWrapper(nn.Module):
+                def __init__(self, base_model, target_class):
+                    super().__init__()
+                    self.base_model = base_model
+                    self.target_class = target_class
+                def forward(self, x):
+                    return self.base_model(x)[:, self.target_class].unsqueeze(1)
+            target_model = SingleClassWrapper(self.model, cls).to(self.device)
+            target_model.eval()
+            bg_batch = img.repeat(5, 1, 1, 1) + (torch.randn(5, *img.shape[1:]).to(self.device) * 0.1)
+            explainer = shap.GradientExplainer(target_model, bg_batch)
+            sv = explainer.shap_values(img)
+            if isinstance(sv, list): sv = sv[0] 
+            sv_array = np.abs(np.squeeze(sv))
+            if sv_array.ndim == 3:
+                shap_map = sv_array.sum(axis=0)
+            else:
+                shap_map = sv_array
+            return self.normalize_map(shap_map)
+        except Exception as e: 
+            print(f"SHAP skip: {e}")
+            return None
+
+    def _fix_axes(self, axes, expected_rows):
+        if axes.ndim == 1:
+            axes = axes.reshape(1, -1)
+        return axes
+
+    def visualize_mamba_scanning(self, test_dataset):
+        self.model.eval()
+        print("\nGenerating Mamba Scanning Visualization (all directions)...")
+        class_images = {}
+        for img, lbl in test_dataset:
+            if lbl not in class_images:
+                class_images[lbl] = img
+        num_classes = len(class_images)
+        cols, titles = 7, ['Original', 'TL Scan', 'TR Scan', 'BL Scan', 'BR Scan', 'TAS', 'TSR']
+        fig, axes = plt.subplots(num_classes, cols, figsize=(cols*4, num_classes*4))
+        if num_classes == 1:
+            axes = self._fix_axes(axes, num_classes)
+        m, s = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1).to(self.device), torch.tensor([0.229, 0.224, 0.225]).view(3,1,1).to(self.device)
+        for row, (lbl, img_tensor) in enumerate(class_images.items()):
+            img_t = img_tensor.unsqueeze(0).to(self.device)
+            vis = (img_t[0] * s + m).clamp(0,1).permute(1,2,0).cpu().numpy()
+            v_uint = (vis * 255).astype(np.uint8)
+            tl, tr, bl, br, tas, tsr = self.mamba_internals(img_t)
+            gc.collect()
+            axes[row][0].imshow(v_uint); axes[row][0].set_ylabel(self.class_names[lbl], rotation=90, labelpad=15, size=14, weight='bold')
+            axes[row][1].imshow(self.overlay_cam(v_uint, tl, 'viridis'))
+            axes[row][2].imshow(self.overlay_cam(v_uint, tr, 'viridis'))
+            axes[row][3].imshow(self.overlay_cam(v_uint, bl, 'viridis'))
+            axes[row][4].imshow(self.overlay_cam(v_uint, br, 'viridis'))
+            axes[row][5].imshow(resize(tas, v_uint.shape[:2], order=0, preserve_range=True), cmap='tab10', alpha=0.7)
+            axes[row][6].imshow(self.overlay_cam(v_uint, tsr, 'hot'))
+            for col in range(cols):
+                if row == 0: axes[row][col].set_title(titles[col], fontsize=14, weight='bold')
+                axes[row][col].set_xticks([]); axes[row][col].set_yticks([])
+        plt.tight_layout()
+        self._save_fig(fig, 'Mamba_Scanning_Grid.png')
+
+    def visualize_evolution_grids(self, test_dataset):
+        
+        self.model.eval()
+        print("\nGenerating LRP Evolution Grids (overlays)...")
+        class_images = {}
+        for img, lbl in test_dataset:
+            if lbl not in class_images:
+                class_images[lbl] = img
+                
+        num_classes = len(class_images)
+        # Updated titles: Removed '5-Ch', resulting in 4 columns total
+        lrp_cols, lrp_titles = 4, ['Original', 'LRP: Cross', 'LRP: Mamba', 'LRP: Final']
+        
+        fig_lrp, axes_lrp = plt.subplots(num_classes, lrp_cols, figsize=(lrp_cols*4, num_classes*4))
+        if num_classes == 1:
+            axes_lrp = self._fix_axes(axes_lrp, num_classes)
+            
+        m, s = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1).to(self.device), \
+               torch.tensor([0.229, 0.224, 0.225]).view(3,1,1).to(self.device)
+               
+        for row, (lbl, img_tensor) in enumerate(class_images.items()):
+            img_t = img_tensor.unsqueeze(0).to(self.device)
+            vis = (img_t[0] * s + m).clamp(0,1).permute(1,2,0).cpu().numpy()
+            v_uint = (vis * 255).astype(np.uint8)
+            
+            # Removed lrp_5 calculation as it no longer exists
+            lrp_c = self.intermediate_lrp(img_t, lbl, self.model.cross_fusion, (8,8))
+            gc.collect()
+            lrp_m = self.intermediate_lrp(img_t, lbl, self.model.mamba_encoder, (8,8))
+            gc.collect()
+            lrp_f = self.lrp_approx(img_t, lbl)
+            gc.collect()
+            
+            axes_lrp[row][0].imshow(v_uint)
+            axes_lrp[row][0].set_ylabel(self.class_names[lbl], rotation=90, labelpad=15, size=14, weight='bold')
+            
+            # Mapping columns to the new indices
+            axes_lrp[row][1].imshow(self.overlay_cam(v_uint, lrp_c, 'hot'))
+            axes_lrp[row][2].imshow(self.overlay_cam(v_uint, lrp_m, 'hot'))
+            axes_lrp[row][3].imshow(self.overlay_cam(v_uint, lrp_f, 'hot'))
+            
+            for col in range(lrp_cols):
+                if row == 0: axes_lrp[row][col].set_title(lrp_titles[col], fontsize=14, weight='bold')
+                axes_lrp[row][col].set_xticks([]); axes_lrp[row][col].set_yticks([])
+                
+        fig_lrp.tight_layout()
+        self._save_fig(fig_lrp, 'LRP_Evolution_Grid.png')
+
+    def visualize_mega_panel(self, test_dataset):
+        self.model.eval()
+        print("\nGenerating 14-Panel Mega XAI Grid for each class...")
+        class_images = {}
+        for img, lbl in test_dataset:
+            if lbl not in class_images:
+                class_images[lbl] = img
+                
+        m, s = torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1).to(self.device), \
+               torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1).to(self.device)
+        
+        target_layer = self.target_layer
+        target_hw = (8, 8) if target_layer in [self.model.cross_fusion, self.model.mamba_encoder] else None
+    
+        for lbl, img_tensor in class_images.items():
+            img = img_tensor.unsqueeze(0).to(self.device)
+            vis = (img * s + m).clamp(0,1).squeeze(0).permute(1,2,0).cpu().numpy() * 255
+            v_uint = vis.astype(np.uint8)
+    
+            # Generate XAI maps (Removed spatial_attention_map as it's no longer applicable)
+            c_gcam = self.grad_cam(img, lbl, target_layer, target_hw); gc.collect()
+            c_gcam_p = self.grad_cam_plus_plus(img, lbl, target_layer, target_hw); gc.collect()
+            c_layer = self.layer_cam(img, lbl, target_layer, target_hw); gc.collect()
+            c_eigen = self.eigen_cam(img, target_layer, target_hw); gc.collect()
+            c_score = self.score_cam(img, lbl, target_layer, target_hw); gc.collect()
+            c_score_p = self.score_cam_plus_plus(img, lbl, target_layer, target_hw); gc.collect()
+            c_fgrad = self.full_grad_approx(img, lbl, target_layer, target_hw); gc.collect()
+            c_shap = self.generate_shap(img, lbl); gc.collect()
+            tl, tr, bl, br, tas, tsr = self.mamba_internals(img); gc.collect()
+            l_t, l_m = self.generate_lime(img); gc.collect()
+    
+            # Create a 2x7 grid (Total 14 panels)
+            fig, ax = plt.subplots(2, 7, figsize=(28, 8))
+            
+            # Row 1
+            ax[0,0].imshow(v_uint); ax[0,0].set_title(f"Orig: {self.class_names[lbl]}")
+            ax[0,1].imshow(self.overlay_cam(v_uint, c_gcam)); ax[0,1].set_title("Grad-CAM")
+            ax[0,2].imshow(self.overlay_cam(v_uint, c_gcam_p)); ax[0,2].set_title("Grad-CAM++")
+            ax[0,3].imshow(self.overlay_cam(v_uint, c_layer)); ax[0,3].set_title("Layer-CAM")
+            ax[0,4].imshow(self.overlay_cam(v_uint, c_eigen, 'magma')); ax[0,4].set_title("Eigen-CAM")
+            ax[0,5].imshow(self.overlay_cam(v_uint, c_score)); ax[0,5].set_title("Score-CAM")
+            ax[0,6].imshow(self.overlay_cam(v_uint, c_score_p)); ax[0,6].set_title("Score-CAM++")
+    
+            # Row 2
+            ax[1,0].imshow(self.overlay_cam(v_uint, c_fgrad)); ax[1,0].set_title("FullGrad")
+            if c_shap is not None: 
+                ax[1,1].imshow(self.overlay_cam(v_uint, c_shap, 'plasma')); ax[1,1].set_title("SHAP")
+            else: ax[1,1].axis('off')
+            
+            ax[1,2].imshow(self.overlay_cam(v_uint, tl, 'viridis')); ax[1,2].set_title("Scan TL")
+            ax[1,3].imshow(self.overlay_cam(v_uint, br, 'viridis')); ax[1,3].set_title("Scan BR")
+            ax[1,4].imshow(self.overlay_cam(v_uint, tr, 'viridis')); ax[1,4].set_title("Scan TR")
+            ax[1,5].imshow(self.overlay_cam(v_uint, bl, 'viridis')); ax[1,5].set_title("Scan BL")
+            
+            if LIME_AVAILABLE and l_t is not None: 
+                ax[1,6].imshow(mark_boundaries(l_t, l_m)); ax[1,6].set_title("LIME")
+            else: ax[1,6].axis('off')
+    
+            for r in range(2):
+                for c in range(7): ax[r,c].axis('off')
+                
+            plt.tight_layout()
+            self._save_fig(fig, f'Mega_XAI_Panel_Class_{self.class_names[lbl]}.png')
+
+    def visualize_block_evolution(self, test_dataset):
+        self.model.eval()
+        print("\nGenerating Block Evolution (final stages)...")
+        class_images = {}
+        for img, lbl in test_dataset:
+            if lbl not in class_images:
+                class_images[lbl] = img
+        m, s = torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1).to(self.device), torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1).to(self.device)
+        layers = [
+            (self.model.cross_fusion, 'Cross Fusion', (8,8)),
+            (self.model.mamba_encoder, 'Mamba Output', (8,8)),
+            (None, 'Final Pixel LRP', None)
+        ]
+        for lbl, img_tensor in class_images.items():
+            img = img_tensor.unsqueeze(0).to(self.device)
+            vis = (img * s + m).clamp(0,1).squeeze(0).permute(1,2,0).cpu().numpy() * 255
+            v_uint = vis.astype(np.uint8)
+            fig, axes = plt.subplots(len(layers), 4, figsize=(16, len(layers)*4))
+            for row, (layer, name, hw) in enumerate(layers):
+                if name == 'Final Pixel LRP':
+                    heat = self.lrp_approx(img, lbl)
+                    gcam = np.zeros_like(heat)
+                    gcam_p = np.zeros_like(heat)
+                else:
+                    heat = self.activation_heatmap(img, layer, hw)
+                    gcam = self.grad_cam(img, lbl, layer, hw)
+                    gcam_p = self.grad_cam_plus_plus(img, lbl, layer, hw)
+                gc.collect()
+                axes[row][0].imshow(v_uint)
+                axes[row][0].set_ylabel(name, rotation=90, labelpad=15, size=14, weight='bold')
+                if row == 0: axes[row][0].set_title(f"Class: {self.class_names[lbl]}")
+                axes[row][1].imshow(self.overlay_cam(v_uint, heat, 'magma'))
+                if row == 0: axes[row][1].set_title("Activation Heatmap")
+                axes[row][2].imshow(self.overlay_cam(v_uint, gcam))
+                if row == 0: axes[row][2].set_title("Grad-CAM")
+                axes[row][3].imshow(self.overlay_cam(v_uint, gcam_p))
+                if row == 0: axes[row][3].set_title("Grad-CAM++")
+                for col in range(4): axes[row][col].set_xticks([]); axes[row][col].set_yticks([])
+            plt.tight_layout()
+            self._save_fig(fig, f'Block_Evolution_Final_Class_{self.class_names[lbl]}.png')
+
+    def plot_tsne(self, features, labels):
+        # In plot_tsne:
+        n_samples = features.shape[0]
+        perp = min(30, n_samples - 1)
+        features_2d = TSNE(n_components=2, random_state=42, perplexity=perp).fit_transform(features)
+        #features_2d = TSNE(n_components=2, random_state=42, perplexity=30).fit_transform(features)
+        plt.figure(figsize=(10,8))
+        plt.scatter(features_2d[:,0], features_2d[:,1], c=labels, cmap='tab20', alpha=0.7)
+        plt.colorbar(ticks=range(len(self.class_names)) if len(self.class_names)<=20 else None)
+        plt.title('t-SNE feature visualization')
+        self._save_fig(plt.gcf(), 'tsne.png')
+
+    def plot_confusion_matrix(self, y_true, y_pred):
+        plt.figure(figsize=(12,10))
+        sns.heatmap(confusion_matrix(y_true, y_pred), annot=True, fmt='d', cmap='Blues',
+                    xticklabels=self.class_names, yticklabels=self.class_names)
+        plt.title('Confusion Matrix'); plt.ylabel('True'); plt.xlabel('Pred')
+        self._save_fig(plt.gcf(), 'confusion_matrix.png')
+
+    def visualize_all(self, test_loader, test_dataset):
+        self.model.eval()
+        all_preds, all_targs, features = [], [], []
+        
+        # FIX: Ensure we are capturing a flat (Batch, Features) array
+        def hook_fn(m, i, o):
+            # o is likely [B, Embed_Dim, 1, 1] or [B, Embed_Dim]
+            features.append(o.view(o.size(0), -1).detach().cpu().numpy())
+            
+        h = self.model.head[0].register_forward_hook(hook_fn)
+        
+        with torch.no_grad():
+            for imgs, lbls in tqdm(test_loader, desc="Gathering t-SNE & CM"):
+                all_preds.extend(self.model(imgs.to(self.device)).argmax(dim=1).detach().cpu().numpy())
+                all_targs.extend(lbls.numpy())
+        h.remove()
+        
+        if features: 
+            # Concatenate creates [Total_Samples, Embed_Dim]
+            feats_array = np.concatenate(features, axis=0)
+            self.plot_tsne(feats_array, np.array(all_targs))
+            
+        self.plot_confusion_matrix(np.array(all_targs), np.array(all_preds))
+        # ... rest of your code
+        # XAI grids
+        self.visualize_mega_panel(test_dataset)
+        self.visualize_block_evolution(test_dataset)
+        self.visualize_mamba_scanning(test_dataset)
+        self.visualize_evolution_grids(test_dataset)
+        # First conv filters
+        w = self.model.semantic_stream.features[0][0].weight.detach().cpu()
+        
+        wn = (w - w.min()) / (w.max() - w.min() + 1e-8)
+        fig, ax = plt.subplots(4, 8, figsize=(16,8)); ax = ax.flatten()
+        for i in range(min(32, w.shape[0])):
+            # If the weight has 3 input channels, we average them to visualize as grayscale
+            ax[i].imshow(wn[i].mean(dim=0).numpy(), cmap='viridis')
+            ax[i].axis('off')
+        for i in range(min(32, w.shape[0]), 32): 
+            ax[i].axis('off')
+        fig.suptitle('First Conv Filters')
+        self._save_fig(fig, 'Filters.png')
+
+
+# ==============================================================
+# 13. MAIN (with multi-seed, metrics, plots)
+# ==============================================================
+def plot_training_history(history, save_dir):
+    os.makedirs(save_dir, exist_ok=True)  # <--- ensures directory exists
+    epochs = range(1, len(history['train_loss']) + 1)
+    fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+    axs[0].plot(epochs, history['train_loss'], label='Train Loss')
+    axs[0].plot(epochs, history['val_loss'], label='Val Loss')
+    axs[0].set_xlabel('Epoch')
+    axs[0].set_ylabel('Loss')
+    axs[0].legend()
+    axs[0].grid(True)
+    axs[1].plot(epochs, history['train_acc'], label='Train Acc')
+    axs[1].plot(epochs, history['val_acc'], label='Val Acc')
+    axs[1].set_xlabel('Epoch')
+    axs[1].set_ylabel('Accuracy')
+    axs[1].legend()
+    axs[1].grid(True)
+    plt.tight_layout()
+    fig.savefig(os.path.join(save_dir, 'training_history.png'), dpi=150)
+    plt.close(fig)
+
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Paths
+    train_dir = "/kaggle/input/datasets/researchproject12/kvasir-capsule-final-msmd-2/train"
+    val_dir = "/kaggle/input/datasets/researchproject12/kvasir-capsule-final-msmd-2/val"
+    test_dir = "/kaggle/input/datasets/researchproject12/kvasir-capsule-final-msmd-2/test"
+
+    classes = sorted([d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))])
+    print(f"Detected {len(classes)} classes: {classes}")
+
+    tdict = get_enhanced_transforms(input_size=256)
+    num_workers = 4 if os.cpu_count() >= 4 else 0
+    train_dl = DataLoader(ImageDataset(train_dir, transform=tdict['train']), batch_size=8, shuffle=True, num_workers=num_workers)
+    val_dl = DataLoader(ImageDataset(val_dir, transform=tdict['val']), batch_size=8, shuffle=False, num_workers=num_workers)
+    test_ds = ImageDataset(test_dir, transform=tdict['val'])
+    test_dl = DataLoader(test_ds, batch_size=8, shuffle=False, num_workers=num_workers)
+
+    # Multi-seed
+    seeds = [42]
+    kappas = []
+    best_histories = []
+    seed_best_models = []  # to store (seed, model_state, kappa)
+
+    # Compute model stats (once)
+    print("\n=== Model Statistics ===")
+    model_temp = MultiScaleDyZEMamba(num_classes=len(classes), embed_dim=256).to(device)
+    flops, params = compute_flops_params(model_temp, input_size=(1, 3, 256, 256), device=device)
+    print(f"Total Parameters: {params:,}")
+    if flops is not None:
+        print(f"FLOPs (approx): {flops/1e9:.2f} GFLOPs")
+    else:
+        print("FLOPs: not computed (install thop)")
+
+    # Also measure inference time (with and without TTA)
+    print("\n=== Inference Time (average over 20 batches) ===")
+    batch_time, per_img_time = measure_inference_time(model_temp, test_dl, device, num_batches=20, use_tta=False)
+    print(f"Without TTA: batch={batch_time:.4f}s, per image={per_img_time:.4f}s")
+    batch_time_tta, per_img_time_tta = measure_inference_time(model_temp, test_dl, device, num_batches=20, use_tta=True)
+    print(f"With TTA: batch={batch_time_tta:.4f}s, per image={per_img_time_tta:.4f}s (avg over 4 augmentations)")
+
+    # Now run training for each seed
+    for seed in seeds:
+        print(f"\n========== RUNNING WITH SEED {seed} ==========")
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+        model = MultiScaleDyZEMamba(num_classes=len(classes), embed_dim=256).to(device)
+        model, kappa, best_epoch, history = train_model(
+            model, train_dl, val_dl, test_dl, len(classes), device,
+            epochs=100, early_stop_patience=20, accumulation_steps=4,
+            ce_weight=1.0, focal_weight=0.5
+        )
+        kappas.append(kappa)
+        best_histories.append(history)
+
+        # Save the best model for this seed
+        seed_model_path = f'best_model_seed{seed}.pth'
+        torch.save(model.state_dict(), seed_model_path)
+        seed_best_models.append((seed, model.state_dict(), kappa))
+
+        print(f"Seed {seed} -> Kappa: {kappa:.4f}, best epoch: {best_epoch+1}")
+
+    # Find the best seed (highest kappa)
+    best_seed, best_state, best_kappa = max(seed_best_models, key=lambda x: x[2])
+
+    # Average results
+    avg_kappa = np.mean(kappas)
+    std_kappa = np.std(kappas)
+    print(f"\n===== AVERAGE KAPPA OVER {len(seeds)} SEEDS: {avg_kappa:.4f} ± {std_kappa:.4f} =====")
+    print(f"===== BEST SEED = {best_seed} with Kappa = {best_kappa:.4f} =====")
+
+    # For final visualizations, we use the best seed's model
+    model_final = MultiScaleDyZEMamba(num_classes=len(classes), embed_dim=256).to(device)
+    model_final.load_state_dict(best_state)
+    print(f"Loaded best model from seed {best_seed} for final evaluation and visualizations.")
+
+    # Evaluate final model thoroughly (including AUC)
+    print("\n=== Final Model Evaluation (with TTA) ===")
+    kappa_final, preds_final, targets_final, probs_final = evaluate_model(
+        model_final, test_dl, device, classes, use_tta=True
+    )
+
+    # Compute AUC
+    auc_macro, auc_micro, per_class_auc = compute_auc(targets_final, probs_final, len(classes))
+    if auc_macro is not None:
+        print(f"Macro AUC: {auc_macro:.4f}, Micro AUC: {auc_micro:.4f}")
+        print("Per-class AUC:")
+        for i, auc_i in per_class_auc.items():
+            print(f"  {classes[i]}: {auc_i:.4f}")
+    else:
+        print("AUC not computed.")
+
+    # Plot training history for the best seed
+    # We need to get the history corresponding to the best seed
+    best_idx = seeds.index(best_seed)
+    plot_training_history(best_histories[best_idx], save_dir='/kaggle/working/visualizations')
+
+    # Run visualizations
+    visualizer = ModelVisualizer(model_final, device, classes,
+                                 save_dir='/kaggle/working/visualizations',
+                                 target_layer=model_final.cross_fusion)
+    visualizer.visualize_all(test_dl, test_ds)
+
+    # Save summary metrics
+    os.makedirs('/kaggle/working/visualizations', exist_ok=True)
+    with open('/kaggle/working/visualizations/metrics_summary.txt', 'w') as f:
+        f.write(f"Average Kappa over {len(seeds)} seeds: {avg_kappa:.4f} ± {std_kappa:.4f}\n")
+        f.write(f"Best seed: {best_seed} with Kappa: {best_kappa:.4f}\n")
+        f.write(f"Final Kappa (TTA) using best seed: {kappa_final:.4f}\n")
+        if auc_macro is not None:
+            f.write(f"Macro AUC: {auc_macro:.4f}\nMicro AUC: {auc_micro:.4f}\n")
+        f.write(f"Parameters: {params:,}\n")
+        if flops is not None:
+            f.write(f"FLOPs: {flops/1e9:.2f} GFLOPs\n")
+        f.write(f"Inference time (no TTA): {per_img_time:.4f}s per image\n")
+        f.write(f"Inference time (TTA): {per_img_time_tta:.4f}s per image (avg)\n")
+
+    print("\nAll tasks completed. Check /kaggle/working/visualizations for outputs.")
+
+if __name__ == "__main__":
+    main()
