@@ -1,0 +1,443 @@
+# ==========================================================
+# IMPORTS
+# ==========================================================
+import os, sys, random, shutil, warnings, json
+import numpy as np
+from pathlib import Path
+from collections import Counter, defaultdict
+import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from torchvision.utils import save_image
+
+from PIL import Image
+from tqdm.auto import tqdm
+from sklearn.neighbors import NearestNeighbors
+from sklearn.model_selection import train_test_split
+
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+warnings.filterwarnings("ignore")
+random.seed(42); np.random.seed(42); torch.manual_seed(42)
+
+# ==========================================================
+# 1. CONFIG
+# ==========================================================
+class QAGSConfig:
+    def __init__(self):
+        self.root_dir   = Path("/kaggle/input/datasets/researchproject12/gastro-vision27/Gastrovision")
+        self.output_base = Path("./qags_results_900")
+        self.train_dir = self.output_base / "Train"
+        self.val_dir   = self.output_base / "Validation"
+        self.test_dir  = self.output_base / "Test"
+
+        self.img_size = 256                 # ↓ from 384 for speed
+        # --- 8 : 1 : 1 split ---
+        self.train_ratio = 0.80
+        self.val_ratio   = 0.10
+        self.test_ratio  = 0.10
+
+        # Target per class *in the training set* (real + synthetic = 900)
+        self.train_target_per_class = 900
+        self.min_samples_threshold  = 4
+
+        self.batch_size   = 16
+        self.latent_dim   = 256
+        self.lr           = 1e-4
+        self.epochs       = 100             # ↓ from 150
+        self.smote_k      = 5
+        self.max_kl_weight = 0.001
+        self.use_amp      = False
+        self.num_workers  = 4
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+
+# ==========================================================
+# 2. ATTENTION MASK
+# ==========================================================
+class GPUAttentionGenerator:
+    def __init__(self, device): self.device = device
+    @torch.no_grad()
+    def generate_mask(self, img_tensor):
+        img = img_tensor.to(self.device)
+        was_3d = img.dim() == 3
+        if was_3d: img = img.unsqueeze(0)
+        x = (img + 1.0) / 2.0
+        mx = x.max(dim=1, keepdim=True)[0]
+        mn = x.min(dim=1, keepdim=True)[0]
+        sat = (mx - mn) / (mx + 1e-7)
+        att = 0.6 * sat + 0.4 * mx
+        bmin = att.view(att.size(0), -1).min(1)[0].view(-1,1,1,1)
+        bmax = att.view(att.size(0), -1).max(1)[0].view(-1,1,1,1)
+        mask = ((att - bmin) / (bmax - bmin + 1e-7) > 0.3).float()
+        return mask.squeeze(0) if was_3d else mask
+
+# ==========================================================
+# 3. DATASET
+# ==========================================================
+class ImprovedMedicalDataset(Dataset):
+    def __init__(self, root_dir, config):
+        self.root_dir = Path(root_dir)
+        self.img_size = config.img_size
+        self.samples, self.class_to_idx, self.idx_to_class = [], {}, {}
+        self.class_indices = defaultdict(list)
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.5]*3, [0.5]*3),
+        ])
+        if not self.root_dir.exists(): return
+        classes = sorted([d.name for d in self.root_dir.iterdir() if d.is_dir()])
+        for idx, name in enumerate(classes):
+            self.class_to_idx[name] = idx
+            self.idx_to_class[idx]  = name
+        for name, idx in self.class_to_idx.items():
+            cpath = self.root_dir / name
+            if not cpath.exists(): continue
+            for ext in ("*.jpg","*.png","*.jpeg","*.bmp"):
+                for p in cpath.rglob(ext):
+                    try:
+                        with Image.open(p) as im: im.verify()
+                        self.samples.append((str(p), idx))
+                        self.class_indices[idx].append(len(self.samples) - 1)
+                    except Exception: pass
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, i):
+        p, y = self.samples[i]
+        img = Image.open(p).convert("RGB").resize((self.img_size, self.img_size), Image.BILINEAR)
+        return {"image": self.transform(img), "label": torch.tensor(y, dtype=torch.long)}
+
+class SubsetDataset(Dataset):
+    def __init__(self, parent, indices): self.parent, self.indices = parent, indices
+    def __len__(self): return len(self.indices)
+    def __getitem__(self, i): return self.parent[self.indices[i]]
+
+def collate_fn(b):
+    return {"image": torch.stack([x["image"] for x in b]),
+            "label": torch.stack([x["label"] for x in b])}
+
+# ==========================================================
+# 4. VAE (smaller & faster)
+# ==========================================================
+class SimpleVAE(nn.Module):
+    def __init__(self, num_classes, latent_dim=128):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.style_emb  = nn.Embedding(num_classes, latent_dim)
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(4, 32, 4, 2, 1),  nn.BatchNorm2d(32),  nn.ReLU(True),
+            nn.Conv2d(32, 64, 4, 2, 1), nn.BatchNorm2d(64),  nn.ReLU(True),
+            nn.Conv2d(64,128, 4, 2, 1), nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.Conv2d(128,256,4, 2, 1), nn.BatchNorm2d(256), nn.ReLU(True),
+            nn.Flatten(),
+        )
+        # 256 x 16 x 16 for 256px input
+        self.fc_mu  = nn.Linear(256*16*16, 512)
+        self.fc_var = nn.Linear(256*16*16, 512)
+        self.fc_out = nn.Linear(512, latent_dim)
+        self.fc_outv= nn.Linear(512, latent_dim)
+
+        self.dec_in = nn.Linear(latent_dim*2, 256*16*16)
+        self.decoder = nn.Sequential(
+            nn.Unflatten(1, (256,16,16)),
+            nn.ConvTranspose2d(256,128,4,2,1), nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.ConvTranspose2d(128, 64,4,2,1), nn.BatchNorm2d(64),  nn.ReLU(True),
+            nn.ConvTranspose2d( 64, 32,4,2,1), nn.BatchNorm2d(32),  nn.ReLU(True),
+            nn.ConvTranspose2d( 32, 16,4,2,1), nn.BatchNorm2d(16),  nn.ReLU(True),
+            nn.Conv2d(16, 3, 3, 1, 1), nn.Tanh(),
+        )
+
+    def encode(self, x, mask, y):
+        h = self.encoder(torch.cat([x, mask], 1)).relu()
+        mu  = self.fc_out(self.fc_mu(h)  if False else F.relu(self.fc_mu(h)))
+        logv= self.fc_outv(F.relu(self.fc_var(h)))
+        logv = torch.clamp(logv, -30.0, 20.0)
+        return mu, logv, self.style_emb(y)
+
+    def decode(self, z, style):
+        return self.decoder(self.dec_in(torch.cat([z, style], 1)))
+
+    def reparameterize(self, mu, logv):
+        return mu + torch.randn_like(mu) * torch.exp(0.5*logv)
+
+    def forward(self, x, mask, y):
+        mu, logv, s = self.encode(x, mask, y)
+        z = self.reparameterize(mu, logv)
+        return self.decode(z, s), mu, logv
+
+# ==========================================================
+# 5. BATCHED MEDICAL SMOTE
+# ==========================================================
+class MedicalSMOTE:
+    def __init__(self, vae, config):
+        self.vae, self.config = vae, config
+        self.device = config.device
+        self.attn   = GPUAttentionGenerator(self.device)
+        self.vae.eval()
+
+    @torch.no_grad()
+    def encode_samples(self, samples, batch_size=64):
+        mus, labels = [], []
+        for i in range(0, len(samples), batch_size):
+            chunk = samples[i:i+batch_size]
+            imgs  = torch.stack([s["image"] for s in chunk]).to(self.device)
+            labs  = torch.stack([s["label"] for s in chunk]).to(self.device)
+            masks = self.attn.generate_mask(imgs)
+            mu, _, _ = self.vae.encode(imgs, masks, labs)
+            mus.append(mu.cpu().numpy())
+            labels.extend(labs.cpu().tolist())
+        return np.concatenate(mus, 0), labels
+
+    def generate_latents(self, mus, labels, n_needed):
+        if len(mus) < 2:
+            base = mus[0]
+            return [{"mu": base + 0.02*(i+1)*np.random.randn(*base.shape),
+                     "label": labels[0]} for i in range(n_needed)]
+        k = min(self.config.smote_k, len(mus)-1)
+        nbrs = NearestNeighbors(n_neighbors=k+1).fit(mus)
+        out = []
+        noise = 0.03 if len(mus) < 10 else 0.07 if len(mus) < 50 else 0.10
+        while len(out) < n_needed:
+            i = np.random.randint(len(mus))
+            _, idx = nbrs.kneighbors([mus[i]])
+            j = np.random.choice(idx[0][1:]) if len(idx[0]) > 1 else i
+            a = np.random.uniform(0.1, 0.8)
+            z = mus[i] + a * (mus[j] - mus[i]) + noise*np.random.randn(*mus[i].shape)
+            out.append({"mu": z.astype(np.float32), "label": labels[i]})
+        return out
+
+    @torch.no_grad()
+    def decode_latents(self, latents, batch_size=64):
+        imgs = []
+        for i in range(0, len(latents), batch_size):
+            chunk = latents[i:i+batch_size]
+            z = torch.tensor(np.stack([c["mu"] for c in chunk]), dtype=torch.float32, device=self.device)
+            y = torch.tensor([c["label"] for c in chunk], dtype=torch.long, device=self.device)
+            style = self.vae.style_emb(y)
+            imgs.append(self.vae.decode(z, style).cpu())
+        return torch.cat(imgs, 0)
+
+# ==========================================================
+# 6. METRICS ENGINE
+# ==========================================================
+class MetricsEngine:
+    """
+    PSNR / SSIM / MSE / MAE / LPIPS: measured on held-out real VAL,
+        comparing real image vs VAE reconstruction (VAE fidelity).
+    FID: real-train distribution vs synthetic distribution (generation quality).
+    """
+    def __init__(self, device):
+        self.device = device
+        self.fid    = FrechetInceptionDistance(feature=64).to(device)
+        self.lpips  = LearnedPerceptualImagePatchSimilarity(net_type='vgg').to(device)
+
+    @torch.no_grad()
+    def reconstruction_metrics(self, model, loader, attn, n_batches=10):
+        model.eval()
+        psnrs, ssims, mses, maes, lpipss = [], [], [], [], []
+        for i, batch in enumerate(loader):
+            if i >= n_batches: break
+            imgs = batch["image"].to(self.device)
+            labs = batch["label"].to(self.device)
+            masks = attn.generate_mask(imgs)
+            recon, _, _ = model(imgs, masks, labs)
+            recon = torch.clamp(recon, -1, 1)
+            mses.append(F.mse_loss(recon, imgs).item())
+            maes.append(F.l1_loss(recon, imgs).item())
+            lpipss.append(self.lpips(imgs, recon).item())
+            r_u8 = ((imgs  + 1)/2*255).clamp(0,255).to(torch.uint8).cpu().numpy().transpose(0,2,3,1)
+            g_u8 = ((recon + 1)/2*255).clamp(0,255).to(torch.uint8).cpu().numpy().transpose(0,2,3,1)
+            for r, g in zip(r_u8, g_u8):
+                psnrs.append(psnr(r, g, data_range=255))
+                ssims.append(ssim(r, g, channel_axis=2, data_range=255))
+        return {"PSNR": float(np.mean(psnrs)), "SSIM": float(np.mean(ssims)),
+                "MSE":  float(np.mean(mses)),  "MAE":  float(np.mean(maes)),
+                "LPIPS":float(np.mean(lpipss))}
+
+    @torch.no_grad()
+    def fid_score(self, real_tensor, fake_tensor, batch_size=32):
+        self.fid.reset()
+        self.fid.to(self.device)
+    
+        def feed(tensor, real_flag):
+            n = tensor.size(0)
+            for i in range(0, n, batch_size):
+                chunk = tensor[i:i+batch_size]
+                chunk = ((chunk + 1) / 2 * 255).clamp(0, 255).to(torch.uint8).to(self.device)
+                self.fid.update(chunk, real=real_flag)
+    
+        feed(real_tensor, True)
+        feed(fake_tensor, False)
+        return float(self.fid.compute().item())
+# ==========================================================
+# 7. TRAINER
+# ==========================================================
+class VAETrainer:
+    def __init__(self, config):
+        self.config = config
+        self.device = config.device
+        self.perc   = LearnedPerceptualImagePatchSimilarity(net_type='vgg').to(config.device)
+        for p in self.perc.parameters(): p.requires_grad = False
+
+    def train(self, model, dataset):
+        print(f"\n🧠 Training VAE on {len(dataset)} training images…")
+        model = model.to(self.device)
+        opt   = torch.optim.Adam(model.parameters(), lr=self.config.lr)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.config.epochs)
+        loader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True,
+                            collate_fn=collate_fn, num_workers=self.config.num_workers,
+                            pin_memory=True, drop_last=True)
+        attn   = GPUAttentionGenerator(self.device)
+        scaler = torch.cuda.amp.GradScaler(enabled=self.config.use_amp and self.device.type=="cuda")
+
+        for epoch in range(self.config.epochs):
+            model.train()
+            kl_w = self.config.max_kl_weight * min(1.0, epoch / 40.0)
+            pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.config.epochs}")
+            for batch in pbar:
+                imgs = batch["image"].to(self.device, non_blocking=True)
+                labs = batch["label"].to(self.device, non_blocking=True)
+                masks = attn.generate_mask(imgs)
+                opt.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=self.config.use_amp and self.device.type=="cuda"):
+                    recon, mu, logv = model(imgs, masks, labs)
+                    recon_c = torch.clamp(recon, -1, 1)
+                    l1  = F.l1_loss(recon, imgs)
+                    pl  = self.perc(imgs, recon_c)
+                    rec = l1 + 0.1 * pl
+                    kl  = -0.5 * torch.mean(1 + logv - mu.pow(2) - logv.exp())
+                    loss = rec + kl_w * kl
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt); scaler.update()
+                pbar.set_postfix(loss=f"{loss.item():.3f}", kl_w=f"{kl_w:.2e}")
+            sched.step()
+        return model
+
+# ==========================================================
+# 8. PIPELINE
+# ==========================================================
+def save_tensor(t, path):
+    """t: [3,H,W] tensor in [-1,1]. Saves as JPEG."""
+    img = (t.clamp(-1, 1) + 1) / 2          # → [0,1]
+    arr = (img.mul(255).add_(0.5).clamp_(0, 255)
+              .permute(1, 2, 0).to("cpu", torch.uint8).numpy())
+    Image.fromarray(arr).save(str(path), format="JPEG", quality=95)
+def split_class(indices, cfg):
+    """8 : 1 : 1 per class, stratified."""
+    tr, tmp = train_test_split(indices, test_size=(1-cfg.train_ratio), random_state=42)
+    va, te  = train_test_split(tmp, test_size=0.5, random_state=42)
+    return tr, va, te
+
+def run_pipeline():
+    cfg = QAGSConfig()
+    print("🔍 Loading dataset…")
+    ds = ImprovedMedicalDataset(cfg.root_dir, cfg)
+    if len(ds) == 0:
+        print("❌ Dataset empty / path wrong."); return
+    print(f"   Loaded {len(ds)} images across {len(ds.class_to_idx)} raw classes.")
+
+    # --- Filter + 8:1:1 split ---
+    valid = {}
+    for name, cid in ds.class_to_idx.items():
+        idx = ds.class_indices.get(cid, [])
+        if len(idx) < cfg.min_samples_threshold:
+            print(f"   ⚠️ Skip {name} ({len(idx)} < {cfg.min_samples_threshold})")
+            continue
+        tr, va, te = split_class(idx, cfg)
+        valid[name] = {"id": cid, "train": tr, "val": va, "test": te}
+        print(f"   ✅ {name}: train={len(tr)} val={len(va)} test={len(te)}")
+    if not valid:
+        print("❌ No classes pass the threshold."); return
+
+    # --- Prepare output dirs ---
+    for d in (cfg.train_dir, cfg.val_dir, cfg.test_dir):
+        if d.exists(): shutil.rmtree(d)
+        d.mkdir(parents=True, exist_ok=True)
+
+    # --- Train VAE on train-only real images ---
+    train_idx_all = [i for c in valid.values() for i in c["train"]]
+    vae = SimpleVAE(len(ds.class_to_idx), cfg.latent_dim)
+    vae = VAETrainer(cfg).train(vae, SubsetDataset(ds, train_idx_all))
+
+    # --- Reconstruction metrics on real VAL (never seen by VAE) ---
+    val_idx_all = [i for c in valid.values() for i in c["val"]]
+    val_loader  = DataLoader(SubsetDataset(ds, val_idx_all), batch_size=cfg.batch_size,
+                             shuffle=False, collate_fn=collate_fn, num_workers=cfg.num_workers)
+    metrics_eng = MetricsEngine(cfg.device)
+    attn = GPUAttentionGenerator(cfg.device)
+    recon_m = metrics_eng.reconstruction_metrics(vae, val_loader, attn, n_batches=20)
+
+    # --- Build splits (synthetic ONLY on train) ---
+    smote = MedicalSMOTE(vae, cfg)
+    all_real_train, all_syn_train = [], []
+    MAX_FID = 1000
+    report = {"per_class": {}, "global_metrics": recon_m}
+
+    for name, c in valid.items():
+        # TRAIN: copy real, then augment to 900
+        tr_dir = cfg.train_dir / name; tr_dir.mkdir(parents=True, exist_ok=True)
+        n_real = 0
+        for i in c["train"]:
+            shutil.copy(ds.samples[i][0], tr_dir / f"real_{n_real:04d}.jpg")
+            n_real += 1
+            all_real_train.append(ds[i]["image"])
+
+        n_syn = 0
+        if n_real < cfg.train_target_per_class:
+            needed = cfg.train_target_per_class - n_real
+            subset = [ds[i] for i in c["train"]]
+            mus, labs = smote.encode_samples(subset)
+            latents   = smote.generate_latents(mus, labs, needed)
+            syn_imgs  = smote.decode_latents(latents)
+            for k, t in enumerate(syn_imgs):
+                save_tensor(t, tr_dir / f"syn_{k:04d}.jpg")
+                all_syn_train.append(t)
+            n_syn = len(syn_imgs)
+
+        # VAL: copy real only
+        va_dir = cfg.val_dir / name; va_dir.mkdir(parents=True, exist_ok=True)
+        for j, i in enumerate(c["val"]):
+            shutil.copy(ds.samples[i][0], va_dir / f"real_{j:04d}.jpg")
+
+        # TEST: copy real only
+        te_dir = cfg.test_dir / name; te_dir.mkdir(parents=True, exist_ok=True)
+        for j, i in enumerate(c["test"]):
+            shutil.copy(ds.samples[i][0], te_dir / f"real_{j:04d}.jpg")
+
+        report["per_class"][name] = {"train_real": n_real, "train_syn": n_syn,
+                                     "val": len(c["val"]), "test": len(c["test"])}
+        print(f"   📁 {name}: train {n_real}+{n_syn}={n_real+n_syn} | val {len(c['val'])} | test {len(c['test'])}")
+
+    # --- Global FID: real-train vs synthetic-train ---
+    if all_syn_train:
+        real_t = torch.stack(all_real_train[:MAX_FID])   # CPU
+        syn_t  = torch.stack(all_syn_train [:MAX_FID])   # CPU
+        report["global_metrics"]["FID"] = metrics_eng.fid_score(real_t, syn_t, batch_size=64)
+        del real_t, syn_t
+
+    # free the accumulators so they don't linger
+    del all_real_train, all_syn_train
+    torch.cuda.empty_cache()
+
+    # --- Write metrics + manifest ---
+    with open(cfg.output_base / "metrics.json", "w") as f:
+        json.dump(report, f, indent=2)
+    print("\n📊 Metrics:", json.dumps(report["global_metrics"], indent=2))
+
+    # --- ZIP ---
+    zip_name = "GastroVision_900_8_1_1"
+    shutil.make_archive(zip_name, "zip", cfg.output_base)
+    print(f"\n🎉 Done. ZIP: {zip_name}.zip  |  metrics: {cfg.output_base}/metrics.json")
+
+if __name__ == "__main__":
+    run_pipeline()
